@@ -320,9 +320,9 @@ Alternatively, if you are compiling locally, you can run the server manually in 
 Interaction with GNU `make` jobserver
 -------------------------------------
 
-sccache provides support for a [GNU make jobserver](https://www.gnu.org/software/make/manual/html_node/Job-Slots.html). When the server is started from a process that provides a jobserver, sccache will use that jobserver and provide it to any processes it spawns. (If you are running sccache from a GNU make recipe, you will need to prefix the command with `+` to get this behavior.) If the sccache server is started without a jobserver present it will create its own with the number of slots equal to the number of available CPU cores.
+sccache uses its own [GNU make jobserver](https://www.gnu.org/software/make/manual/html_node/Job-Slots.html), with the number of slots equal to the number of available CPU cores. It acquires a slot for each child process and shares the jobserver with Rust compilations for parallel codegen. The daemon does not inherit Cargo or make's jobserver, since it can serve multiple independent builds.
 
-This is most useful when using sccache for Rust compilation, as rustc supports using a jobserver for parallel codegen, so this ensures that rustc will not overwhelm the system with codegen tasks. Cargo implements its own jobserver ([see the information on `NUM_JOBS` in the cargo documentation](https://doc.rust-lang.org/stable/cargo/reference/environment-variables.html#environment-variables-cargo-sets-for-build-scripts)) for rustc to use, so using sccache for Rust compilation in cargo via `RUSTC_WRAPPER` should do the right thing automatically.
+If a compiler sharing the jobserver fails or is cancelled, it may leave borrowed slots unreturned. sccache stops admitting new jobserver requests while existing users and already queued acquisitions finish, then replaces the pool with its original capacity. Successful compilations keep using the same pool.
 
 ---
 

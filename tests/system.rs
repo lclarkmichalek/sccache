@@ -46,6 +46,145 @@ use which::{which, which_in};
 
 mod harness;
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn jobserver_recovers_after_compiler_failure_and_cancellation() {
+    use std::os::unix::net::UnixStream;
+    use tokio::time::{sleep, timeout};
+
+    let slots = sccache::util::num_cpus();
+    if slots < 2 {
+        eprintln!("skipping jobserver recovery test: needs at least two CPU slots");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let rustc = which("rustc").unwrap();
+    let wrapper = root.join("rustc");
+    write_source(
+        root,
+        "wrapper.rs",
+        include_str!("testdata/jobserver-rustc.rs"),
+    );
+    Command::new(&rustc)
+        .arg(root.join("wrapper.rs"))
+        .arg("-o")
+        .arg(&wrapper)
+        .assert()
+        .success();
+    write_source(root, "lib.rs", "pub fn answer() -> u32 { 42 }");
+    write_source(root, "config", "");
+    let socket = root.join("server.sock");
+    let command = || {
+        let mut cmd = sccache_command();
+        cmd.env("SCCACHE_SERVER_UDS", &socket)
+            .env("SCCACHE_DIR", root.join("cache"))
+            .env("SCCACHE_CONF", root.join("config"))
+            .env("SCCACHE_CACHED_CONF", root.join("cached-config"))
+            .env("SCCACHE_TEST_REAL_RUSTC", &rustc);
+        cmd
+    };
+    let mut start = command();
+    start
+        .env("SCCACHE_START_SERVER", "1")
+        .env("SCCACHE_NO_DAEMON", "1")
+        .env("SCCACHE_IDLE_TIMEOUT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    let mut server = tokio::process::Command::from(start)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while UnixStream::connect(&socket).is_err() {
+            assert!(server.try_wait().unwrap().is_none());
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("private server failed to start");
+
+    // A control compile returns its borrowed token; each killed compile loses
+    // one. Without recovery, the reported capacity decreases on every run.
+    for (attempt, action) in ["normal", "kill", "cancel", "kill", "normal"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut cmd = command();
+        cmd.arg(&wrapper)
+            .args([
+                "--crate-name",
+                &format!("probe{attempt}"),
+                "--crate-type",
+                "lib",
+                "--emit",
+                "dep-info,link",
+            ])
+            .arg(root.join("lib.rs"))
+            .arg("--out-dir")
+            .arg(root);
+        if action == "kill" {
+            cmd.env("SCCACHE_TEST_KILL_COMPILER", "1");
+        }
+        if action == "cancel" {
+            let ready = root.join("ready");
+            cmd.env("SCCACHE_TEST_PAUSE_COMPILER", &ready)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut client = tokio::process::Command::from(cmd)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            timeout(Duration::from_secs(10), async {
+                while !ready.exists() {
+                    assert!(client.try_wait().unwrap().is_none());
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("compiler did not borrow a token");
+            let ready = fs::read_to_string(ready).unwrap();
+            let (available, pid) = ready.split_once(' ').unwrap();
+            assert_eq!(available.parse::<usize>().unwrap(), slots - 1);
+            client.kill().await.unwrap();
+            timeout(Duration::from_secs(10), async {
+                while let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
+                    // Tokio may reap a killed child on the next spawn.
+                    if status.lines().any(|line| line.starts_with("State:\tZ")) {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("compiler survived client cancellation");
+            continue;
+        }
+        let output = timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::from(cmd)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("compilation stalled")
+        .unwrap();
+        assert_eq!(output.status.success(), action == "normal", "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("jobserver tokens: {}\n", slots - 1)),
+            "{output:?}"
+        );
+        if action == "kill" {
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("Compiler killed by signal 9"),
+                "{output:?}"
+            );
+        }
+    }
+    server.kill().await.unwrap();
+}
+
 #[derive(Clone)]
 struct Compiler {
     pub name: &'static str,

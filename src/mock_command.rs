@@ -171,17 +171,16 @@ impl CommandChild for Child {
         self.inner.stderr.take()
     }
 
-    async fn wait(self) -> io::Result<ExitStatus> {
-        let Child { mut inner, token } = self;
-        inner.wait().await.inspect(|_ret| {
-            drop(token);
+    async fn wait(mut self) -> io::Result<ExitStatus> {
+        self.inner.wait().await.inspect(|status| {
+            self.token.completed(*status);
         })
     }
 
     async fn wait_with_output(self) -> io::Result<Output> {
-        let Child { inner, token } = self;
-        inner.wait_with_output().await.inspect(|_ret| {
-            drop(token);
+        let Child { inner, mut token } = self;
+        inner.wait_with_output().await.inspect(|output| {
+            token.completed(output.status);
         })
     }
 }
@@ -266,6 +265,9 @@ impl RunCommand for AsyncCommand {
         inner.env_remove("MAKEFLAGS");
         inner.env_remove("MFLAGS");
         inner.env_remove("CARGO_MAKEFLAGS");
+        // Acquire before configuring so the child inherits the same pool
+        // that owns its token, even if a previous pool is being retired.
+        let mut token = self.jobserver.acquire().await?;
         // `configure` registers a `pre_exec` closure to clear `CLOEXEC` on the
         // jobserver's file descriptors, and any `pre_exec` makes `std` fall
         // back from `posix_spawn` to `fork`+`exec`. Almost nothing sccache
@@ -273,13 +275,9 @@ impl RunCommand for AsyncCommand {
         // C/C++ compilers all ignore it -- so the default is not to share,
         // and the callers that spawn `rustc` ask for it.
         if self.share_jobserver {
-            self.jobserver.configure(&mut inner);
+            token.configure(&mut inner);
         }
 
-        // The token is acquired either way: it rate-limits how many children
-        // *we* run, which is separate from whether the child can acquire
-        // tokens of its own.
-        let token = self.jobserver.acquire().await?;
         let mut inner = tokio::process::Command::from(inner);
         let child = inner
             .kill_on_drop(true)

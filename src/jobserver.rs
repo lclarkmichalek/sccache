@@ -1,10 +1,11 @@
 use std::io;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::channel::oneshot;
+use tokio::sync::Notify;
 
 use crate::errors::*;
 
@@ -35,13 +36,93 @@ use crate::errors::*;
 
 #[derive(Clone)]
 pub struct Client {
-    helper: Option<Arc<jobserver::HelperThread>>,
-    tx: Option<mpsc::UnboundedSender<oneshot::Sender<io::Result<jobserver::Acquired>>>>,
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    state: Mutex<State>,
+    changed: Notify,
+    limit: usize,
+}
+
+struct State {
+    pool: Option<Arc<Pool>>,
+    users: usize,
+    needs_reset: bool,
+}
+
+struct Pool {
+    helper: jobserver::HelperThread,
+    tx: mpsc::UnboundedSender<oneshot::Sender<io::Result<jobserver::Acquired>>>,
     inner: jobserver::Client,
 }
 
 pub struct Acquired {
-    _token: Option<jobserver::Acquired>,
+    // Return the token before allowing the pool to become idle.
+    _token: jobserver::Acquired,
+    reservation: Reservation,
+}
+
+struct Reservation {
+    shared: Arc<Shared>,
+    pool: Arc<Pool>,
+    may_have_leaked: bool,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let retired = {
+            let mut state = self.shared.state.lock().unwrap();
+            state.needs_reset |= self.may_have_leaked;
+            state.users -= 1;
+            if state.needs_reset && state.users == 0 {
+                debug!("Retiring jobserver after a shared child failed or was cancelled");
+                state.needs_reset = false;
+                let retired = state.pool.take();
+                self.shared.changed.notify_waiters();
+                retired
+            } else {
+                None
+            }
+        };
+        drop(retired);
+    }
+}
+
+impl Acquired {
+    pub fn configure(&mut self, cmd: &mut Command) {
+        // Cancellation also kills the child, so assume its borrowed tokens
+        // are lost unless it completes successfully.
+        self.reservation.may_have_leaked = true;
+        self.reservation.pool.inner.configure(cmd);
+    }
+
+    pub fn completed(&mut self, status: std::process::ExitStatus) {
+        if status.success() {
+            self.reservation.may_have_leaked = false;
+        }
+    }
+}
+
+impl Pool {
+    fn new(num: usize) -> Result<Self> {
+        let inner = jobserver::Client::new(num).context("failed to create jobserver")?;
+        let (tx, mut rx) = mpsc::unbounded::<oneshot::Sender<_>>();
+        let helper = inner
+            .clone()
+            .into_helper_thread(move |token| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    if let Some(sender) = rx.next().await {
+                        drop(sender.send(token));
+                    }
+                });
+            })
+            .context("failed to spawn helper thread")?;
+        Ok(Self { inner, helper, tx })
+    }
 }
 
 impl Client {
@@ -50,37 +131,19 @@ impl Client {
     }
 
     pub fn new_num(num: usize) -> Client {
-        let inner = jobserver::Client::new(num).expect("failed to create jobserver");
-        Client::_new(inner, false)
-    }
-
-    fn _new(inner: jobserver::Client, inherited: bool) -> Client {
-        let (helper, tx) = if inherited {
-            (None, None)
-        } else {
-            let (tx, mut rx) = mpsc::unbounded::<oneshot::Sender<_>>();
-            let helper = inner
-                .clone()
-                .into_helper_thread(move |token| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .build()
-                        .unwrap();
-                    rt.block_on(async {
-                        if let Some(sender) = rx.next().await {
-                            drop(sender.send(token));
-                        }
-                    });
-                })
-                .expect("failed to spawn helper thread");
-            (Some(Arc::new(helper)), Some(tx))
-        };
-
-        Client { inner, helper, tx }
-    }
-
-    /// Configures this jobserver to be inherited by the specified command
-    pub fn configure(&self, cmd: &mut Command) {
-        self.inner.configure(cmd);
+        Client {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State {
+                    pool: Some(Arc::new(
+                        Pool::new(num).expect("failed to create jobserver"),
+                    )),
+                    users: 0,
+                    needs_reset: false,
+                }),
+                changed: Notify::new(),
+                limit: num,
+            }),
+        }
     }
 
     /// Returns a future that represents an acquired jobserver token.
@@ -89,13 +152,34 @@ impl Client {
     /// definition of "work" is) to ensure that the system is properly
     /// rate-limiting itself.
     pub async fn acquire(&self) -> Result<Acquired> {
-        let (helper, tx) = match (self.helper.as_ref(), self.tx.as_ref()) {
-            (Some(a), Some(b)) => (a, b),
-            _ => return Ok(Acquired { _token: None }),
+        let reservation = loop {
+            let changed = self.shared.changed.notified();
+            let reservation = {
+                let mut state = self.shared.state.lock().unwrap();
+                if state.needs_reset {
+                    None
+                } else {
+                    if state.pool.is_none() {
+                        state.pool = Some(Arc::new(Pool::new(self.shared.limit)?));
+                    }
+                    state.users += 1;
+                    Some(Reservation {
+                        shared: self.shared.clone(),
+                        pool: state.pool.as_ref().unwrap().clone(),
+                        may_have_leaked: false,
+                    })
+                }
+            };
+            if let Some(reservation) = reservation {
+                break reservation;
+            }
+            // Stop admitting work to a damaged pool so it can drain even
+            // under continuous load. Pending acquisitions count as users too.
+            changed.await;
         };
         let (mytx, myrx) = oneshot::channel();
-        helper.request_token();
-        tx.unbounded_send(mytx).unwrap();
+        reservation.pool.tx.unbounded_send(mytx).unwrap();
+        reservation.pool.helper.request_token();
 
         let acquired = myrx
             .await
@@ -103,7 +187,170 @@ impl Client {
             .context("failed to acquire jobserver token")?;
 
         Ok(Acquired {
-            _token: Some(acquired),
+            _token: acquired,
+            reservation,
         })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::mock_command::exit_status;
+    use std::time::Duration;
+
+    async fn acquire(client: &Client) -> Acquired {
+        tokio::time::timeout(Duration::from_secs(5), client.acquire())
+            .await
+            .expect("jobserver acquisition timed out")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn successful_child_keeps_pool() {
+        let client = Client::new_num(2);
+        let mut token = acquire(&client).await;
+        let pool = token.reservation.pool.clone();
+        token.configure(&mut Command::new("rustc"));
+        token.completed(exit_status(0));
+        drop(token);
+        let next = acquire(&client).await;
+        assert!(Arc::ptr_eq(&pool, &next.reservation.pool));
+        assert_eq!(pool.inner.available().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_unshared_child_keeps_pool() {
+        let client = Client::new_num(2);
+        let mut token = acquire(&client).await;
+        let pool = token.reservation.pool.clone();
+        token.completed(exit_status(1));
+        drop(token);
+        let next = acquire(&client).await;
+        assert!(Arc::ptr_eq(&pool, &next.reservation.pool));
+        assert_eq!(pool.inner.available().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_child_recovers_borrowed_tokens() {
+        let client = Client::new_num(4);
+        for _ in 0..3 {
+            let mut token = acquire(&client).await;
+            token.configure(&mut Command::new("rustc"));
+            let pool = token.reservation.pool.clone();
+            for _ in 0..3 {
+                pool.inner.acquire().unwrap().drop_without_releasing();
+            }
+            token.completed(exit_status(1));
+            drop(token);
+            let next = acquire(&client).await;
+            assert!(!Arc::ptr_eq(&pool, &next.reservation.pool));
+            assert_eq!(next.reservation.pool.inner.available().unwrap(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_child_recovers_borrowed_tokens() {
+        let client = Client::new_num(2);
+        let mut token = acquire(&client).await;
+        token.configure(&mut Command::new("rustc"));
+        token
+            .reservation
+            .pool
+            .inner
+            .acquire()
+            .unwrap()
+            .drop_without_releasing();
+        drop(token);
+        let next = acquire(&client).await;
+        assert_eq!(next.reservation.pool.inner.available().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_waits_for_existing_users_and_blocks_new_work() {
+        let client = Client::new_num(3);
+        let mut failed = acquire(&client).await;
+        failed.configure(&mut Command::new("rustc"));
+        let peer = acquire(&client).await;
+        let pool = peer.reservation.pool.clone();
+        pool.inner.acquire().unwrap().drop_without_releasing();
+
+        let mut queued = Box::pin(client.acquire());
+        assert!(futures::poll!(&mut queued).is_pending());
+        drop(failed);
+        let queued = tokio::time::timeout(Duration::from_secs(5), queued)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&pool, &queued.reservation.pool));
+
+        let mut next = Box::pin(client.acquire());
+        assert!(futures::poll!(&mut next).is_pending());
+        drop(queued);
+        assert!(futures::poll!(&mut next).is_pending());
+        assert_eq!(pool.inner.available().unwrap(), 1);
+        drop(peer);
+
+        let next = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&pool, &next.reservation.pool));
+        assert_eq!(next.reservation.pool.inner.available().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_acquisitions_do_not_prevent_recovery() {
+        let client = Client::new_num(2);
+        let mut failed = acquire(&client).await;
+        failed.configure(&mut Command::new("rustc"));
+        failed
+            .reservation
+            .pool
+            .inner
+            .acquire()
+            .unwrap()
+            .drop_without_releasing();
+        let mut queued = Box::pin(client.acquire());
+        assert!(futures::poll!(&mut queued).is_pending());
+        drop(failed);
+        let mut waiting_for_reset = Box::pin(client.acquire());
+        assert!(futures::poll!(&mut waiting_for_reset).is_pending());
+        drop(waiting_for_reset);
+        drop(queued);
+        let next = acquire(&client).await;
+        assert_eq!(next.reservation.pool.inner.available().unwrap(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_wakes_all_waiters_without_exceeding_capacity() {
+        let client = Client::new_num(2);
+        let peer = acquire(&client).await;
+        let mut failed = acquire(&client).await;
+        failed.configure(&mut Command::new("rustc"));
+        drop(failed);
+        let mut first = Box::pin(client.acquire());
+        let mut second = Box::pin(client.acquire());
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        drop(peer);
+        let (first, second) = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::try_join(first, second),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &first.reservation.pool,
+            &second.reservation.pool
+        ));
+        let mut excess = Box::pin(client.acquire());
+        assert!(futures::poll!(&mut excess).is_pending());
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), excess)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
